@@ -1,0 +1,498 @@
+"""Main clustering pipeline orchestrator."""
+
+import os
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any
+import numpy as np
+import torch
+
+from BatchTopK.sae import TopKSAE, VanillaSAE
+from sae_variants.banded_cov_sae import BandedCovarianceSAE
+from real_data_utils import collect_real_activity_stats
+from mess3_gmg_analysis_utils import sae_encode_features
+from subspace_clustering_utils import normalize_and_deduplicate
+
+from clustering.config import ClusteringConfig
+from clustering.results import ClusteringResult
+from clustering.strategies import create_clustering_strategy, ClusteringStrategyResult
+from clustering.belief_seeding import BeliefSeeder, BeliefSeedingResult
+from clustering.analysis import ClusterAnalyzer
+from clustering.epdf_generator import EPDFGenerator
+from clustering.affinity_metrics import (
+    COOCCURRENCE_METRICS,
+    CooccurrenceStats,
+    collect_cooccurrence_stats,
+)
+
+# ... (imports)
+
+class RealDataClusteringPipeline:
+    """Main orchestrator for clustering a single site (Real Data)."""
+
+    def __init__(
+        self,
+        sae: Any,
+        config: ClusteringConfig,
+        hook_name_override: Optional[str] = None,
+    ):
+        self.sae = sae
+        self.config = config
+        self.sae.eval()
+        
+        # Derive hook_name from SAE config or override
+        if hook_name_override:
+            self.hook_name = hook_name_override
+        elif hasattr(self.sae.cfg, "hook_name"):
+            self.hook_name = self.sae.cfg.hook_name
+        elif hasattr(self.sae.cfg, "metadata") and "hook_name" in self.sae.cfg.metadata:
+            self.hook_name = self.sae.cfg.metadata["hook_name"]
+        else:
+            raise ValueError("SAE config must have 'hook_name' attribute or it must be provided via hook_name_override.")
+
+    def run(
+        self,
+        model,
+        cache: Dict,
+        data_source,
+        site_dir: str,
+        component_beliefs_flat: Optional[Dict[str, np.ndarray]] = None,
+        component_order: Optional[List[str]] = None,
+        component_metadata: Optional[Dict[str, Dict[str, Any]]] = None,
+        site_idx: int = 0,
+        device: str = "cpu",
+    ) -> ClusteringResult:
+        """Run complete clustering pipeline for a site.
+
+        Args:
+            model: Transformer model
+            cache: Activation cache from model
+            data_source: Data source for sampling
+            site_dir: Output directory for site-specific files
+            component_beliefs_flat: Component beliefs (for seeding/R²)
+            component_order: Ordered component names
+            component_metadata: Component metadata (for EPDFs)
+            site_idx: Site index (for random seeding)
+            device: Device for computation
+        """
+        config = self.config
+        site = config.site
+        selected_k = config.selected_k
+        sae = self.sae
+
+        decoder_dirs = sae.W_dec.detach().clone()
+
+        # Determine if we need co-occurrence stats
+        sim_metric = config.spectral_params.sim_metric if config.method == "spectral" else None
+        needs_cooccurrence = (
+            config.method == "spectral" and
+            sim_metric in COOCCURRENCE_METRICS
+        )
+
+        # Collect activity statistics
+        # If threshold is 0 or None, we skip sampling and assume all latents are active
+        if not config.sampling_config.latent_activity_threshold:
+            print(f"{site}: Skipping activity stats collection (threshold is 0/None). Using all latents.")
+            activity_rates = np.ones(decoder_dirs.shape[0])
+            mean_abs_activation = np.zeros(decoder_dirs.shape[0]) # Dummy values
+            latent_activity_matrix = None
+            total_activity_samples = 0
+        else:
+
+            activity_stats = collect_real_activity_stats(
+                model,
+                sae,
+                data_source,
+                self.hook_name,
+                batch_size=config.sampling_config.sample_sequences,
+                sample_len=config.sampling_config.sample_seq_len or model.cfg.n_ctx,
+                n_batches=config.sampling_config.activation_batches,
+                device=device,
+                activation_eps=config.sampling_config.latent_activation_eps,
+                collect_matrix=False,  # We'll collect co-occurrence stats separately if needed
+            )
+
+            activity_rates = activity_stats["activity_rates"]
+            mean_abs_activation = activity_stats["mean_abs_activation"]
+            latent_activity_matrix = None  # Deprecated - use cooccurrence_stats instead
+            total_activity_samples = int(activity_stats["total_samples"])
+
+        # Collect co-occurrence statistics if using a co-occurrence metric
+        cooccurrence_stats = None
+        if needs_cooccurrence:
+            cooc_config = config.spectral_params.cooccurrence_config
+
+            # Try to load from cache first
+            if cooc_config.cache_path and Path(cooc_config.cache_path).exists():
+                print(f"Loading cached co-occurrence stats from {cooc_config.cache_path}")
+                cooccurrence_stats = CooccurrenceStats.load(cooc_config.cache_path)
+                print(cooccurrence_stats.summary())
+            else:
+                print(f"Collecting co-occurrence statistics ({cooc_config.total_tokens:,} tokens)...")
+                print(f"  n_batches={cooc_config.n_batches}, batch_size={cooc_config.batch_size}, seq_len={cooc_config.seq_len}")
+
+                cooccurrence_stats = collect_cooccurrence_stats(
+                    model,
+                    sae,
+                    data_source,  # Must have sample_tokens_batch() method
+                    self.hook_name,
+                    sae_encode_fn=sae_encode_features,
+                    n_batches=cooc_config.n_batches,
+                    batch_size=cooc_config.batch_size,
+                    seq_len=cooc_config.seq_len,
+                    activation_threshold=cooc_config.activation_threshold,
+                    device=device,
+                    skip_special_tokens=cooc_config.skip_special_tokens,
+                    show_progress=True,
+                )
+                print(cooccurrence_stats.summary())
+
+                # Save to cache if path provided
+                if cooc_config.cache_path:
+                    cooccurrence_stats.save(cooc_config.cache_path)
+
+        # Prepare activations
+        # Activations are not required for core clustering on real data
+        # We skip sampling to save time/memory as requested
+        acts = None
+        acts_flat = None
+        feature_acts = None
+        x_mean = None
+        x_std = None
+
+        # Filter active latents
+        # activity_rates is numpy (from collect_real_activity_stats)
+        active_mask = activity_rates >= config.sampling_config.latent_activity_threshold
+        active_indices = np.nonzero(active_mask)[0]
+        inactive_indices = np.where(~active_mask)[0]
+        
+        # Convert active_indices to tensor for indexing decoder_dirs (which is tensor)
+        active_indices_tensor = torch.from_numpy(active_indices).to(decoder_dirs.device)
+
+        print(
+            f"{site}: {active_indices.size}/{decoder_dirs.shape[0]} latents pass activity threshold "
+            f"{config.sampling_config.latent_activity_threshold:.2%}"
+        )
+
+        cluster_labels_full = np.full(decoder_dirs.shape[0], -1, dtype=int)
+        # We'll fill this using numpy at the end, or convert to tensor if needed.
+        # Since ClusteringResult expects numpy, let's keep this as numpy for now,
+        # but use a tensor for active latents during clustering.
+        cluster_labels_active_tensor = None
+
+        # Handle no active latents case
+        if active_indices.size == 0:
+            return self._create_empty_result(
+                config, site, selected_k, cluster_labels_full,
+                activity_rates, mean_abs_activation, total_activity_samples,
+                active_indices, inactive_indices,
+            )
+
+        decoder_active = decoder_dirs[active_indices_tensor]
+        n_active_before_dedup = len(decoder_active)
+
+        # Normalize and deduplicate upfront (before any other processing)
+        # Determine protected positions for deduplication (belief-seeded indices if applicable)
+        protected_positions = None
+        if config.belief_seeding.enabled and config.belief_seeding.protect_seed_duplicates:
+            # Note: We can't protect belief seeds yet since we haven't computed them
+            # Belief seeding will happen after dedup, so protection isn't applicable here
+            pass
+
+        decoder_normalized, kept_indices_in_active = normalize_and_deduplicate(
+            decoder_active,
+            cosine_threshold=config.subspace_params.cosine_dedup_threshold,
+            protected_indices=protected_positions,
+        )
+
+        # Update active_indices to refer to kept (deduplicated) indices
+        # kept_indices_in_active is a tensor (from normalize_and_deduplicate)
+        active_indices_tensor = active_indices_tensor[kept_indices_in_active]
+        active_indices = active_indices[kept_indices_in_active.cpu().numpy()] # Keep numpy version synced
+        decoder_active = decoder_normalized  # Use deduplicated, normalized decoder
+
+        print(f"{site}: after deduplication, kept {len(decoder_active)}/{n_active_before_dedup} active latents")
+
+        # Belief-aligned seeding
+        belief_seeder = BeliefSeeder(config.belief_seeding)
+        belief_seed_result: Optional[BeliefSeedingResult] = None
+
+        if component_beliefs_flat and component_order and acts_flat is not None:
+            # Subsample beliefs if needed
+            component_beliefs_for_seeding = {}
+            for comp_name in component_order:
+                comp_flat = component_beliefs_flat[comp_name]
+                if subsample_idx is not None:
+                    comp_flat = comp_flat[subsample_idx]
+                component_beliefs_for_seeding[comp_name] = comp_flat
+
+            belief_seed_result = belief_seeder.compute_seed_clusters(
+                acts_flat,
+                feature_acts,
+                decoder_active,
+                active_indices,
+                component_beliefs_for_seeding,
+                component_order,
+                site,
+                site_idx,
+            )
+
+        # Run clustering
+        strategy = create_clustering_strategy(config)
+
+        # Handle trivial case: single active latent
+        if decoder_active.shape[0] == 1:
+            # Create soft weights for single point
+            soft_weights_trivial = np.array([[1.0]])  # (1, 1) - single point, single cluster
+            strategy_result = ClusteringStrategyResult(
+                cluster_labels=np.array([0], dtype=int),
+                n_clusters=1,
+                diagnostics={"clustering_method": config.method},
+                soft_weights=soft_weights_trivial,
+            )
+        else:
+            strategy_result = strategy.cluster(
+                decoder_active,
+                active_indices_tensor,
+                config,
+                site,
+                site_dir,
+                latent_activity_matrix=latent_activity_matrix,
+                cooccurrence_stats=cooccurrence_stats,
+                belief_seed_clusters=belief_seed_result.seed_clusters_active if belief_seed_result and belief_seed_result.succeeded else None,
+                component_order=component_order,
+            )
+
+        # Map labels to full set
+        # strategy_result.cluster_labels is now a tensor (or numpy)
+        labels_active = strategy_result.cluster_labels
+        if isinstance(labels_active, torch.Tensor):
+            labels_active = labels_active.cpu().numpy()
+            
+        cluster_labels_full[active_indices] = labels_active
+
+        # Report seed retention
+        if belief_seed_result and belief_seed_result.succeeded:
+            belief_seeder.report_seed_retention(
+                belief_seed_result.seed_clusters_global,
+                cluster_labels_full,
+                site,
+            )
+
+        print(f"{site}: clustered {decoder_active.shape[0]} active latents into {strategy_result.n_clusters} groups")
+
+        # Cluster analysis
+        analyzer = ClusterAnalyzer(config.analysis_config)
+        cluster_recons = {}
+        cluster_stats = {}
+        if acts_flat is not None:
+            encoded_cache = (feature_acts, x_mean, x_std)
+            cluster_recons, cluster_stats = analyzer.collect_reconstructions(
+                acts_flat,
+                sae,
+                cluster_labels_full,
+                config.sampling_config.cluster_activation_threshold,
+                encoded_cache=encoded_cache,
+            )
+
+        feature_np_for_r2 = None
+        if feature_acts is not None:
+            feature_np_for_r2 = feature_acts.detach().cpu().numpy()
+            del feature_acts, encoded_cache, x_mean, x_std
+
+        # Add activity rates to stats
+        per_site_cluster_rates = analyzer.add_activity_rates_to_stats(
+            cluster_stats, activity_rates, mean_abs_activation
+        )
+
+        # PCA analysis (if enabled and stats available)
+        pca_results = None
+        if cluster_stats:
+            pca_results = analyzer.fit_pca_and_project(
+                cluster_recons,
+                cluster_stats,
+                sae,
+                config.sampling_config.min_cluster_samples,
+            )
+
+        # Belief R² scoring (hard + soft assignments)
+        belief_r2_summary = None
+        belief_r2_summary_soft = None
+        component_assignment = None
+        component_assignment_soft = None
+
+        if component_beliefs_flat and component_order:
+            # Re-subsample beliefs if needed
+            component_beliefs_for_scoring = {}
+            for comp_name in component_order:
+                comp_flat = component_beliefs_flat[comp_name]
+                if subsample_idx is not None:
+                    comp_flat = comp_flat[subsample_idx]
+                component_beliefs_for_scoring[comp_name] = comp_flat
+
+            # Compute hard R²
+            belief_r2_summary = analyzer.compute_belief_r2(
+                acts_flat,
+                feature_np_for_r2,
+                decoder_dirs,
+                cluster_labels_full,
+                strategy_result.n_clusters,
+                component_beliefs_for_scoring,
+                component_order,
+                config.belief_seeding.ridge_alpha,
+                site,
+                soft_assignments=None,
+                assignment_name="hard",
+            )
+
+            # Compute optimal assignment for hard R²
+            if belief_r2_summary:
+                component_assignment = analyzer.compute_optimal_component_assignment(
+                    belief_r2_summary,
+                    component_order,
+                    strategy_result.n_clusters,
+                )
+
+            # Compute soft R² if soft assignments exist
+            if strategy_result.soft_weights is not None:
+                # Filter to active latents for soft R²
+                # soft_weights has shape (n_active_latents, n_clusters)
+                # Need to pass filtered data matching this shape
+                active_feature_acts = feature_np_for_r2[:, active_indices]
+                active_decoder_dirs = decoder_dirs[active_indices]
+                active_cluster_labels = cluster_labels_full[active_indices]
+
+                belief_r2_summary_soft = analyzer.compute_belief_r2(
+                    acts_flat,
+                    active_feature_acts,
+                    active_decoder_dirs,
+                    active_cluster_labels,
+                    strategy_result.n_clusters,
+                    component_beliefs_for_scoring,
+                    component_order,
+                    config.belief_seeding.ridge_alpha,
+                    site,
+                    soft_assignments=strategy_result.soft_weights,
+                    assignment_name="soft",
+                )
+
+                # Compute optimal assignment for soft R²
+                if belief_r2_summary_soft:
+                    component_assignment_soft = analyzer.compute_optimal_component_assignment(
+                        belief_r2_summary_soft,
+                        component_order,
+                        strategy_result.n_clusters,
+                    )
+
+        # Activation coherence metrics
+        coherence_metrics = None
+        coherence_metrics_soft = None
+        if feature_np_for_r2 is not None and cluster_labels_full is not None:
+            # Hard coherence
+            coherence_metrics = analyzer.compute_activation_coherence_metrics(
+                feature_np_for_r2,
+                cluster_labels_full,
+                strategy_result.n_clusters,
+                soft_assignments=None,
+            )
+
+            # Soft coherence (if soft assignments exist)
+            if strategy_result.soft_weights is not None:
+                # Filter to active latents only for soft coherence
+                # soft_weights shape: (n_active_latents, n_clusters)
+                # feature_np_for_r2 shape: (n_samples, n_latents_total)
+                # We need to filter feature_np_for_r2 to only active latents
+                active_feature_acts = feature_np_for_r2[:, active_indices]
+                active_cluster_labels = cluster_labels_full[active_indices]
+
+                coherence_metrics_soft = analyzer.compute_activation_coherence_metrics(
+                    active_feature_acts,
+                    active_cluster_labels,
+                    strategy_result.n_clusters,
+                    soft_assignments=strategy_result.soft_weights,
+                )
+
+        # Build result
+        result = ClusteringResult(
+            config=config,
+            site=site,
+            selected_k=selected_k,
+            cluster_labels=cluster_labels_full,
+            n_clusters=strategy_result.n_clusters,
+            active_indices=active_indices,
+            inactive_indices=inactive_indices,
+            activity_rates=activity_rates,
+            mean_abs_activation=mean_abs_activation,
+            total_activity_samples=total_activity_samples,
+            cluster_stats=cluster_stats,
+            belief_seed_metadata=belief_seed_result.metadata if belief_seed_result and belief_seed_result.succeeded else None,
+            belief_r2_summary=belief_r2_summary,
+            belief_r2_summary_soft=belief_r2_summary_soft,
+            component_assignment=component_assignment,
+            component_assignment_soft=component_assignment_soft,
+            coherence_metrics=coherence_metrics,
+            coherence_metrics_soft=coherence_metrics_soft,
+            subspace_diagnostics=strategy_result.diagnostics,
+            pca_results=pca_results,
+        )
+
+        # Store strategy result for geometry refinement (soft assignments)
+        result._strategy_result = strategy_result
+
+        # Store PCA plotting data for later (when we have site_dir)
+        if pca_results:
+            result._pca_plot_data = {
+                'seed': config.seed,
+            }
+
+        # EPDF generation (if enabled and has component data)
+        epdf_generator = EPDFGenerator(config.epdf_config)
+        if component_metadata and component_beliefs_flat and component_order:
+            component_beliefs_for_epdf = {}
+            for comp_name in component_order:
+                comp_flat = component_beliefs_flat[comp_name]
+                if subsample_idx is not None:
+                    comp_flat = comp_flat[subsample_idx]
+                component_beliefs_for_epdf[comp_name] = comp_flat
+
+            # Note: EPDFs will be generated when save_to_directory is called
+            # Store the necessary data in result for later
+            result._epdf_data = {
+                'sae': sae,
+                'acts_flat': acts_flat,
+                'component_beliefs_flat': component_beliefs_for_epdf,
+                'component_metadata': component_metadata,
+                'component_order': component_order,
+                'decoder_normalized': strategy_result.decoder_normalized,
+                'normalized_to_full_idx': strategy_result.normalized_to_full_idx,
+                'decoder_dirs': decoder_dirs,
+            }
+
+        return result
+
+    def _create_empty_result(
+        self,
+        config: ClusteringConfig,
+        site: str,
+        selected_k: int,
+        cluster_labels_full: np.ndarray,
+        activity_rates: np.ndarray,
+        mean_abs_activation: np.ndarray,
+        total_activity_samples: int,
+        active_indices: np.ndarray,
+        inactive_indices: np.ndarray,
+    ) -> ClusteringResult:
+        """Create result for case with no active latents."""
+        return ClusteringResult(
+            config=config,
+            site=site,
+            selected_k=selected_k,
+            cluster_labels=cluster_labels_full,
+            n_clusters=0,
+            active_indices=active_indices,
+            inactive_indices=inactive_indices,
+            activity_rates=activity_rates,
+            mean_abs_activation=mean_abs_activation,
+            total_activity_samples=total_activity_samples,
+            cluster_stats={},
+            belief_seed_metadata=None if not config.belief_seeding.enabled else {"applied": False},
+        )
